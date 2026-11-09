@@ -1,0 +1,6 @@
+[project]
+name = "software-factory-orchestrator"
+version = "0.1.0"
+description = "Local Codex CLI orchestration for the Software Factory SSDLC project"
+requires-python = ">=3.14"
+dependencies = []
