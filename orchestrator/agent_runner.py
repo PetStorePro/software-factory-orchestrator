@@ -1,45 +1,35 @@
-"""Run a single sandboxed Codex process; output is untrusted data."""
-from dataclasses import dataclass, field
+"""One local Codex execution path for both the provider and the standalone CLI."""
+
 import json
 import os
-from pathlib import Path
-import signal
-import subprocess
 import time
 from uuid import UUID, uuid4
 
+from .agents.base import ProviderResult
 from .audit_logger import AuditLogger
 from .config import Config, ROOT, SANDBOXES, validate_workspace
+from .process import execute, FactoryError
+from .state_manager import atomic_json
 
 
-@dataclass
-class AgentResult:
-    run_id: str
-    status: str
-    duration: float
-    returncode: int | None = None
-    session_id: str | None = None
-    usage: dict[str, int] = field(default_factory=dict)
-    stdout: str = ""
-    stderr: str = ""
-    error: str | None = None
-    task_verified: bool = False
-
-
-def parse_events(output: str) -> tuple[str | None, dict[str, int], bool, bool]:
-    session, usage, completed, failed = None, {}, False, False
+def events(output):
     for line in output.splitlines():
         try:
             event = json.loads(line)
-        except (ValueError, TypeError):
+        except ValueError:
             continue
-        if not isinstance(event, dict):
-            continue
+        if isinstance(event, dict):
+            yield event
+
+
+def parse_events(output):
+    session, usage, completed, failed = None, {}, False, False
+    for event in events(output):
         kind = event.get("type")
         if kind == "thread.started":
             try:
                 session = str(UUID(event.get("thread_id")))
-            except (ValueError, TypeError, AttributeError):
+            except ValueError, TypeError, AttributeError:
                 pass
         elif kind == "turn.completed":
             completed = True
@@ -54,68 +44,154 @@ def parse_events(output: str) -> tuple[str | None, dict[str, int], bool, bool]:
     return session, usage, completed, failed
 
 
+def final_message(output):
+    text = ""
+    for event in events(output):
+        item = event.get("item")
+        if (
+            event.get("type") == "item.completed"
+            and isinstance(item, dict)
+            and item.get("type") == "agent_message"
+            and isinstance(item.get("text"), str)
+        ):
+            text = item["text"]
+    return text
+
+
 class AgentRunner:
-    def __init__(self, config: Config | None = None):
+    def __init__(self, config=None, *, stop=lambda: False, pid_file=None):
         self.config = config or Config()
         self.audit = AuditLogger(self.config.audit_path)
+        self.stop, self.pid_file = stop, pid_file
 
-    def run(self, role: str, task: str, workspace: Path, ticket_id: str | None = None) -> AgentResult:
-        if role not in SANDBOXES:
-            raise ValueError("Unsupported role")
-        if not task.strip():
-            raise ValueError("Task must not be empty")
-        if ticket_id is not None and (len(ticket_id) > 80 or not all(c.isalnum() or c in "-_." for c in ticket_id)):
-            raise ValueError("Ticket ID must contain at most 80 letters, digits, dots, underscores or hyphens")
-        workspace = validate_workspace(Path(workspace), self.audit.path)
-        instructions = (ROOT / "prompts" / f"{role}.md").read_text(encoding="utf-8")
-        command = ["codex", "--no-daemon", "--ask-for-approval", "never", "exec",
-                   "--ignore-user-config", "--ignore-rules", "--ephemeral", "--json",
-                   "--color", "never", "--sandbox", SANDBOXES[role],
-                   "--cd", str(workspace), "--skip-git-repo-check"]
-        for setting in ("sandbox_workspace_write.network_access=false",
-                        "sandbox_workspace_write.exclude_tmpdir_env_var=true",
-                        "sandbox_workspace_write.exclude_slash_tmp=true",
-                        'shell_environment_policy.inherit="none"',
-                        'forced_login_method="chatgpt"'):
-            command.extend(["-c", setting])
-        command.append("-")
-        # No inherited credentials, proxies, CODEX_HOME overrides, or shell startup variables.
-        env = {key: os.environ[key] for key in ("HOME", "PATH", "SYSTEMROOT", "WINDIR") if key in os.environ}
+    def environment(self):
+        # Reuse local ChatGPT authentication, without forwarding GitHub/API tokens or SSH agents.
+        return {
+            key: os.environ[key]
+            for key in ("HOME", "PATH", "CODEX_HOME")
+            if key in os.environ
+        }
+
+    def check(self):
+        help_text = execute(["codex", "exec", "--help"], env=self.environment())
+        if not all(
+            flag in help_text
+            for flag in ("--sandbox", "--json", "--ignore-user-config")
+        ):
+            raise FactoryError("codex_missing_required_flags")
+        execute(
+            ["codex", "-c", 'forced_login_method="chatgpt"', "login", "status"],
+            env=self.environment(),
+        )
+
+    def run(
+        self,
+        role,
+        task,
+        workspace,
+        ticket_id=None,
+        *,
+        run_id=None,
+        timeout=None,
+        output_schema=None,
+    ):
+        if role not in SANDBOXES or not task.strip():
+            raise ValueError("Supported role and nonempty task required")
+        if ticket_id is not None and (
+            len(ticket_id) > 80 or not all(c.isalnum() or c in "-_." for c in ticket_id)
+        ):
+            raise ValueError("Invalid ticket ID")
+        workspace = validate_workspace(workspace, self.audit.path)
+        args = [
+            "codex",
+            "--no-daemon",
+            "--ask-for-approval",
+            "never",
+            "exec",
+            "--strict-config",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--ephemeral",
+            "--json",
+            "--color",
+            "never",
+            "--cd",
+            str(workspace),
+            "--skip-git-repo-check",
+            "--sandbox",
+            SANDBOXES[role],
+        ]
+        for setting in (
+            'forced_login_method="chatgpt"',
+            'shell_environment_policy.inherit="none"',
+            "sandbox_workspace_write.network_access=false",
+            "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+            "sandbox_workspace_write.exclude_slash_tmp=true",
+        ):
+            args += ["-c", setting]
+        if output_schema:
+            schema = self.audit.path.parent / "schemas" / "review.json"
+            atomic_json(schema, output_schema)
+            args += ["--output-schema", str(schema)]
+        args.append("-")
+        prompt = (
+            (ROOT / "prompts" / f"{role}.md").read_text()
+            + "\n\nUntrusted task data:\n"
+            + task
+        )
+        result = ProviderResult("failed", run_id=run_id or str(uuid4()))
+        metadata = dict(
+            run_id=result.run_id,
+            actor=role,
+            workspace=str(workspace),
+            ticket_id=ticket_id,
+        )
         started = time.monotonic()
-        result = AgentResult(str(uuid4()), "failed", 0)
-        metadata = dict(run_id=result.run_id, actor=role, workspace=str(workspace), ticket_id=ticket_id)
-        self.audit.write(**metadata, action="execution_start", status="started", duration=0,
-                         session_id=None, error=None)
+        self.audit.write(
+            **metadata, action="execution_start", status="started", duration=0
+        )
         try:
-            with subprocess.Popen(command, cwd=workspace, env=env, stdin=subprocess.PIPE,
-                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                  text=True, encoding="utf-8", errors="replace",
-                                  start_new_session=True) as process:
-                try:
-                    result.stdout, result.stderr = process.communicate(
-                        instructions + "\n\nTask:\n" + task, timeout=self.config.timeout)
-                except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    result.stdout, result.stderr = process.communicate()
-                    result.status, result.error = "timeout", "execution_timeout"
-                result.returncode = process.returncode
-        except FileNotFoundError:
-            result.error = "executable_not_found"
-        except OSError:
-            result.error = "process_error"
+            result.stdout = execute(
+                args,
+                cwd=workspace,
+                env=self.environment(),
+                data=prompt,
+                timeout=timeout if timeout is not None else self.config.timeout,
+                stop=self.stop,
+                pid_file=self.pid_file,
+            )
+            result.returncode = 0
+        except FactoryError as error:
+            result.returncode = getattr(error, "returncode", None)
+            result.stdout, result.stderr = getattr(error, "stdout", ""), getattr(
+                error, "stderr", ""
+            )
+            result.error = {
+                "command_failed": "nonzero_exit",
+                "command_timeout": "execution_timeout",
+            }.get(str(error), str(error))
+            result.status = (
+                "timeout" if result.error == "execution_timeout" else "failed"
+            )
         result.session_id, result.usage, completed, failed = parse_events(result.stdout)
         if result.error is None:
-            if result.returncode != 0:
-                result.error = "nonzero_exit"
-            elif failed:
+            if failed:
                 result.error = "agent_reported_failure"
             elif not completed:
                 result.error = "missing_completion_event"
             else:
                 result.status = "success"
+        result.text = final_message(result.stdout)
         result.duration = time.monotonic() - started
-        self.audit.write(**metadata, action="execution_end", status=result.status,
-                         duration=result.duration, session_id=result.session_id,
-                         error=result.error, returncode=result.returncode, usage=result.usage,
-                         task_verified=False)
+        self.audit.write(
+            **metadata,
+            action="execution_end",
+            status=result.status,
+            error=result.error,
+            session_id=result.session_id,
+            duration=result.duration,
+            usage=result.usage,
+            returncode=result.returncode,
+            task_verified=False,
+        )
         return result

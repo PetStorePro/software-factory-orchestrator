@@ -1,7 +1,10 @@
-"""Trusted configuration, never loaded from agent workspaces."""
+"""Small environment-based configuration; never loaded from target source files."""
+
 from dataclasses import dataclass, field
-from pathlib import Path
 import math
+import os
+from pathlib import Path
+import re
 
 ROOT = Path(__file__).resolve().parent.parent
 SANDBOXES = {"developer": "workspace-write", "reviewer": "read-only"}
@@ -10,22 +13,104 @@ SANDBOXES = {"developer": "workspace-write", "reviewer": "read-only"}
 @dataclass(frozen=True)
 class Config:
     timeout: float = 300
-    audit_path: Path = field(default_factory=lambda: Path.home() / ".software-factory" / "audit.jsonl")
+    audit_path: Path = field(
+        default_factory=lambda: Path.home() / ".software-factory/audit.jsonl"
+    )
 
     def __post_init__(self):
         if not math.isfinite(self.timeout) or self.timeout <= 0:
             raise ValueError("Timeout must be finite and positive")
 
 
-def overlaps(a: Path, b: Path) -> bool:
+def overlaps(a, b):
     return a.is_relative_to(b) or b.is_relative_to(a)
 
 
-def validate_workspace(workspace: Path, audit_path: Path) -> Path:
-    workspace = workspace.expanduser().resolve(strict=True)
-    if not workspace.is_dir():
-        raise ValueError("Workspace must be an existing directory")
-    protected = (ROOT, Path.home() / ".codex", audit_path.expanduser().resolve().parent)
-    if any(overlaps(workspace, path.resolve()) for path in protected):
-        raise ValueError("Workspace overlaps orchestrator, authentication storage, or audit directory")
+def validate_workspace(workspace, audit_path):
+    workspace = Path(workspace).expanduser().resolve(strict=True)
+    auth = (
+        Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+        .expanduser()
+        .resolve()
+    )
+    if (
+        not workspace.is_dir()
+        or overlaps(workspace, ROOT)
+        or overlaps(workspace, auth)
+        or audit_path.resolve().is_relative_to(workspace)
+    ):
+        raise ValueError(
+            "Workspace must be a directory separate from policies, authentication and logs"
+        )
     return workspace
+
+
+@dataclass(frozen=True)
+class FactoryConfig:
+    repository: str
+    runtime: Path = field(default_factory=lambda: Path.home() / ".software-factory/m1")
+    issue_label: str = "ai-ready"
+    developer_provider: str = "codex"
+    reviewer_provider: str = "codex"
+    required_checks: tuple[str, ...] = ("ci", "security")
+    poll_interval: int = 30
+    agent_timeout: int = 600
+    ci_timeout: int = 1800
+    max_ci_fixes: int = 2
+    max_review_cycles: int = 3
+
+    def __post_init__(self):
+        if not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9_.-]*", self.repository
+        ):
+            raise ValueError("GITHUB_REPOSITORY must be owner/repository")
+        if self.repository.lower() == "petstorepro/software-factory-orchestrator":
+            raise ValueError("The orchestrator cannot target itself")
+        if (
+            not self.required_checks
+            or self.max_ci_fixes < 0
+            or min(
+                self.poll_interval,
+                self.agent_timeout,
+                self.ci_timeout,
+                self.max_review_cycles,
+            )
+            <= 0
+        ):
+            raise ValueError(
+                "Checks, positive timeouts and bounded retry settings are required"
+            )
+        runtime = self.runtime.expanduser().resolve()
+        if overlaps(runtime, ROOT):
+            raise ValueError("Runtime must be outside the orchestrator checkout")
+        object.__setattr__(self, "runtime", runtime)
+
+    @classmethod
+    def from_env(cls):
+        values = {
+            name: os.environ[env]
+            for name, env in (
+                ("repository", "GITHUB_REPOSITORY"),
+                ("issue_label", "GITHUB_ISSUE_LABEL"),
+                ("developer_provider", "AI_DEVELOPER_PROVIDER"),
+                ("reviewer_provider", "AI_REVIEWER_PROVIDER"),
+            )
+            if env in os.environ
+        }
+        values["repository"] = values.get("repository", "")
+        if "FACTORY_RUNTIME" in os.environ:
+            values["runtime"] = Path(os.environ["FACTORY_RUNTIME"])
+        if "REQUIRED_CHECKS" in os.environ:
+            values["required_checks"] = tuple(
+                s.strip() for s in os.environ["REQUIRED_CHECKS"].split(",") if s.strip()
+            )
+        for name, env in (
+            ("poll_interval", "POLL_INTERVAL_SECONDS"),
+            ("agent_timeout", "AGENT_TIMEOUT_SECONDS"),
+            ("ci_timeout", "CI_TIMEOUT_SECONDS"),
+            ("max_ci_fixes", "MAX_CI_FIX_ATTEMPTS"),
+            ("max_review_cycles", "MAX_REVIEW_CYCLES"),
+        ):
+            if env in os.environ:
+                values[name] = int(os.environ[env])
+        return cls(**values)

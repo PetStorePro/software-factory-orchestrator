@@ -1,4 +1,5 @@
 """Metadata-only JSONL logging. Callers must never pass model text."""
+
 from datetime import datetime, timezone
 import json
 import os
