@@ -1,4 +1,4 @@
-"""Serial Issue → implementation → CI → independent review → human handoff."""
+"""Process one Issue through development, CI and AI review before handing it to a human."""
 
 import json
 import time
@@ -11,6 +11,8 @@ from .state_manager import INACTIVE, READY, WorkflowState
 
 
 class Workflow:
+    """Coordinate agents, Git, CI and reviews for one Issue at a time."""
+
     def __init__(
         self, config, states, github, git, developer, reviewer, audit, *, progress=None
     ):
@@ -24,6 +26,8 @@ class Workflow:
         self.progress(f"Issue #{state.issue}: {message}")
 
     def checkpoint(self, state, status, action):
+        """Save the new stage and record the transition in the audit log."""
+
         state.status = status
         self.states.save(state)
         self.audit.write(
@@ -54,6 +58,8 @@ class Workflow:
             raise FactoryError("pr_changed_outside_factory")
 
     def once(self):
+        """Resume saved active work or choose the oldest new Issue and record any blocking error."""
+
         self.progress("Looking for a ready issue or saved work...")
         saved = self.states.all()
         active = [s for s in saved if s.status not in INACTIVE]
@@ -116,6 +122,8 @@ class Workflow:
 
     def run(self, state):
         # Checkpoints retain only operations that can be interrupted independently
+        """Follow saved stages until human handoff, a blocking error or a stop request."""
+
         while not self.states.stopped() and state.status not in INACTIVE:
             if state.status == "CLAIMED":
                 self.say(state, "Preparing the work folder and feature branch.")
@@ -222,7 +230,7 @@ class Workflow:
                 self.say(state, "Posting the review on GitHub.")
                 report = self.reviews.publish(
                     state
-                )  # Includes the final positive COMMENT; never a GitHub approval.
+                )  # Post the final positive comment without granting GitHub approval.
                 if report["verdict"] == "approved":
                     self.label(state, READY)
                     self.checkpoint(state, READY, "human_handoff")
@@ -242,11 +250,15 @@ class Workflow:
                 raise FactoryError("unsupported_workflow_checkpoint")
 
     def repair(self, state, feedback):
+        """Save feedback and return to development without creating another PR."""
+
         state.iteration += 1
         state.feedback = feedback
         self.checkpoint(state, "IMPLEMENTING", "repair_requested")
 
     def can_skip_ci(self, state, checks):
+        """Allow the explicit demo exception only when checks and workflow files are absent."""
+
         return (
             self.config.allow_missing_ci
             and all(
@@ -258,6 +270,8 @@ class Workflow:
         )
 
     def review(self, state):
+        """Run a fresh Reviewer or recover a saved report for the current commit."""
+
         self.verify_pr(state)
         if state.review_cycle >= self.config.max_review_cycles:
             raise FactoryError("review_cycle_limit_reached")
