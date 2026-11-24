@@ -1,4 +1,4 @@
-"""Local commands. Neither this CLI nor its GitHub adapter can integrate a PR."""
+"""Provide commands to start, inspect and stop the factory. Never merge or deploy."""
 
 import argparse
 from dataclasses import asdict
@@ -6,16 +6,21 @@ import json
 import os
 from pathlib import Path
 import signal
+from urllib.parse import quote
 
 from .agent_runner import AgentRunner
 from .agents import create_provider
 from .audit_logger import AuditLogger
 from .config import Config, FactoryConfig, SANDBOXES
 from .git_manager import GitManager
-from .github_client import GitHubClient, LABELS
+from .github_client import GitHubClient, GitHubError, LABELS
 from .process import FactoryError, stop_agent
 from .state_manager import StateManager, atomic_json, execution_lock
 from .workflow import Workflow
+
+
+def show_progress(message):
+    print(f"[Factory] {message}", flush=True)
 
 
 def main(argv=None):
@@ -47,6 +52,8 @@ def main(argv=None):
 
 
 def start(states):
+    """Stop any recorded old agent, clear the stop request and register shutdown signals."""
+
     stop_agent(states.root / "agent-process.json")
     states.clear_stop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -54,6 +61,8 @@ def start(states):
 
 
 def standalone(args):
+    """Run one local agent task without creating an Issue workflow."""
+
     runtime = (
         Path(os.environ.get("FACTORY_RUNTIME", Path.home() / ".software-factory/m1"))
         .expanduser()
@@ -81,6 +90,8 @@ def standalone(args):
 
 
 def factory(args):
+    """Handle factory commands and run the serial Issue queue when requested."""
+
     config = FactoryConfig.from_env()
     states = StateManager(config.runtime, config.repository)
     audit = AuditLogger(config.runtime / "audit.jsonl")
@@ -114,9 +125,15 @@ def factory(args):
             if (
                 state is None
                 or not state.resume_status
-                or state.reason == "potential_secret_detected"
+                or state.reason
+                in ("potential_secret_detected", "security_policy_violation")
             ):
                 raise FactoryError("issue_cannot_be_retried")
+            if state.reason == "independent_review_failed":
+                if state.review_cycle >= config.max_review_cycles:
+                    raise FactoryError("review_cycle_limit_reached")
+                # Preserve the failed review and start a fresh review within the remaining limit.
+                state.resume_status = "REVIEWING"
             state.status, state.reason = state.resume_status, None
             states.save(state)
             audit.write(
@@ -129,6 +146,7 @@ def factory(args):
         live = args.command in ("once", "watch") and not args.dry_run
         if live:
             start(states)
+            show_progress("Checking the setup...")
         developer = create_provider(
             config.developer_provider, config, audit, states.stopped
         )
@@ -139,15 +157,25 @@ def factory(args):
             config.repository, audit, states.stopped if live else lambda: False
         )
         info = github.repository_info()
+        try:
+            github.get(f"branches/{quote(config.base_branch, safe='')}")
+            base_exists = True
+        except GitHubError as error:
+            if error.http_status != 404:
+                raise
+            base_exists = False
         developer.check()  # Local help and existing login status only, no model call.
         missing = ((LABELS - {"ai-ready"}) | {config.issue_label}) - {
             label["name"] for label in github.listing("labels")
         }
         report = {
             "repository": config.repository,
-            "main_is_default": info.get("default_branch") == "main",
+            "base_branch": config.base_branch,
+            "base_branch_exists": base_exists,
+            "repository_default_branch": info.get("default_branch"),
             "missing_labels": sorted(missing),
-            "live_allowed": not missing and info.get("default_branch") == "main",
+            "allow_missing_ci": config.allow_missing_ci,
+            "live_allowed": not missing and base_exists,
         }
         atomic_json(config.runtime / "preflight.json", report)
         if not live or not report["live_allowed"]:
@@ -157,6 +185,9 @@ def factory(args):
                 ]
             print(json.dumps(report, indent=2))
             return 0 if report["live_allowed"] else 2
+        show_progress("The setup is ready.")
+        if config.allow_missing_ci:
+            show_progress("Test mode is on. CI may be skipped if no workflows exist.")
         workflow = Workflow(
             config,
             states,
@@ -165,6 +196,7 @@ def factory(args):
             developer,
             reviewer,
             audit,
+            progress=show_progress,
         )
         while not states.stopped():
             workflow.once()
@@ -172,6 +204,9 @@ def factory(args):
                 break
             workflow.pause()
         audit.write(actor="orchestrator", action="factory_stopped", status="stopped")
+        show_progress(
+            "The factory has stopped. Use the status command to see the result."
+        )
         return 0
 
 

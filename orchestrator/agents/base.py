@@ -1,3 +1,5 @@
+"""Define the request and result shared by agent providers."""
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -5,6 +7,8 @@ from typing import Protocol
 
 @dataclass(frozen=True)
 class AgentRequest:
+    """Hold the task, role and work folder passed to an agent."""
+
     role: str
     task: str
     workspace: Path
@@ -16,6 +20,8 @@ class AgentRequest:
 
 @dataclass
 class ProviderResult:
+    """Hold agent output and execution details. Success alone does not prove correctness."""
+
     status: str
     text: str = ""
     session_id: str | None = None
@@ -30,6 +36,8 @@ class ProviderResult:
 
 
 class AgentProvider(Protocol):
+    """Describe the methods every supported agent provider must offer."""
+
     name: str
 
     def run(self, request: AgentRequest) -> ProviderResult: ...

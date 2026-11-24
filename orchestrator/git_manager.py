@@ -1,4 +1,4 @@
-"""Host-only Git operations; agents receive a source export without .git."""
+"""Manage Git copies and publish checked changes from agent work folders."""
 
 import hashlib
 import json
@@ -18,11 +18,14 @@ IGNORED_DIRS = {
     "build",
     ".next",
     "coverage",
+    "target",
 }
 HIDDEN_CONTROL = {".codex", ".agents", "AGENTS.md"}
 
 
 class GitManager:
+    """Keep Git operations separate from agent edits and check changes before publishing."""
+
     def __init__(self, config, audit, stop=lambda: False):
         self.config, self.audit, self.stop = config, audit, stop
         # Disable user/system hooks, aliases, filters, SSH commands and signing.
@@ -45,6 +48,8 @@ class GitManager:
         )
 
     def git(self, state, *args, cwd=None):
+        """Run a Git command with controlled settings and record its result in the audit log."""
+
         self.audit.write(
             run_id=state.run_id,
             ticket_id=f"issue-{state.issue}",
@@ -84,7 +89,12 @@ class GitManager:
         return result
 
     def prepare(self, state):
-        if state.branch != f"ai/issue-{state.issue}":
+        """Fetch the base branch and create or reuse the feature branch owned by this Issue."""
+
+        if (
+            state.branch != f"ai/issue-{state.issue}"
+            or state.branch == state.base_branch
+        ):
             raise FactoryError("unsafe_feature_branch")
         checkout, _ = self.paths(state)
         checkout.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -109,9 +119,9 @@ class GitManager:
             "fetch",
             "--no-tags",
             "origin",
-            "+refs/heads/main:refs/remotes/origin/main",
+            f"+refs/heads/{state.base_branch}:refs/remotes/origin/{state.base_branch}",
         )
-        # Existing local branch is authoritative only when the durable state owns it.
+        # Reuse a local branch only as part of the saved Issue workflow.
         refs = self.git(
             state, "for-each-ref", "--format=%(refname)", f"refs/heads/{state.branch}"
         ).strip()
@@ -120,9 +130,11 @@ class GitManager:
                 state, "ls-remote", "--heads", "origin", f"refs/heads/{state.branch}"
             ).strip()
             if remote_branch:
-                # Never adopt a branch of unknown provenance on a newly claimed Issue.
+                # Do not take over a remote branch when this runtime has no local copy.
                 raise FactoryError("feature_branch_already_exists_without_local_state")
-            self.git(state, "checkout", "-b", state.branch, "origin/main")
+            self.git(
+                state, "checkout", "-b", state.branch, f"origin/{state.base_branch}"
+            )
         else:
             self.git(state, "checkout", state.branch)
         return self.git(state, "rev-parse", "HEAD").strip()
@@ -157,6 +169,8 @@ class GitManager:
         return result
 
     def export(self, state):
+        """Rebuild the agent folder from a clean commit and save content hashes for comparison."""
+
         _, source = self.paths(state)
         if (
             self.head(state) != state.sha
@@ -184,6 +198,8 @@ class GitManager:
         return self.paths(state)[1]
 
     def changes(self, state):
+        """Compare agent files with the saved hashes and validate additions, edits and deletions."""
+
         source = self.workspace(state)
         baseline = json.loads(
             (
@@ -221,6 +237,8 @@ class GitManager:
         return changes
 
     def commit(self, state):
+        """Import valid edits and create a commit, or reuse one already made for this operation."""
+
         operation = f"{state.run_id}-{state.iteration}"
         message = self.git(state, "log", "-1", "--format=%B")
         if f"Factory-Operation: {operation}" in message:
@@ -267,8 +285,10 @@ class GitManager:
         return self.head(state)
 
     def push(self, state):
+        """Push only the expected feature branch without forcing remote changes."""
+
         branch = f"ai/issue-{state.issue}"
-        if state.branch != branch:
+        if state.branch != branch or branch == state.base_branch:
             raise FactoryError("unsafe_push_target")
-        # No force, no broad refspec, no default-branch destination.
+        # Push only this feature branch and never force changes on GitHub.
         self.git(state, "push", "origin", f"HEAD:refs/heads/{branch}")

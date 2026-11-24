@@ -1,4 +1,4 @@
-"""One local Codex execution path for both the provider and the standalone CLI."""
+"""Run Codex with role instructions and return its result and execution details."""
 
 import json
 import os
@@ -9,10 +9,13 @@ from .agents.base import ProviderResult
 from .audit_logger import AuditLogger
 from .config import Config, ROOT, SANDBOXES, validate_workspace
 from .process import execute, FactoryError
+from .security import SAFETY_REFUSAL
 from .state_manager import atomic_json
 
 
 def events(output):
+    """Read JSON events from output and ignore lines that are not valid event objects."""
+
     for line in output.splitlines():
         try:
             event = json.loads(line)
@@ -23,6 +26,8 @@ def events(output):
 
 
 def parse_events(output):
+    """Collect the session, token counts and completion or failure signals from events."""
+
     session, usage, completed, failed = None, {}, False, False
     for event in events(output):
         kind = event.get("type")
@@ -45,6 +50,8 @@ def parse_events(output):
 
 
 def final_message(output):
+    """Return the last completed message written by the agent."""
+
     text = ""
     for event in events(output):
         item = event.get("item")
@@ -59,6 +66,8 @@ def final_message(output):
 
 
 class AgentRunner:
+    """Prepare role instructions, run Codex and record the execution result."""
+
     def __init__(self, config=None, *, stop=lambda: False, pid_file=None):
         self.config = config or Config()
         self.audit = AuditLogger(self.config.audit_path)
@@ -68,11 +77,13 @@ class AgentRunner:
         # Reuse local ChatGPT authentication, without forwarding GitHub/API tokens or SSH agents.
         return {
             key: os.environ[key]
-            for key in ("HOME", "PATH", "CODEX_HOME")
+            for key in ("HOME", "PATH", "CODEX_HOME", "JAVA_HOME")
             if key in os.environ
         }
 
     def check(self):
+        """Check local Codex options and login without calling a model."""
+
         help_text = execute(["codex", "exec", "--help"], env=self.environment())
         if not all(
             flag in help_text
@@ -95,6 +106,8 @@ class AgentRunner:
         timeout=None,
         output_schema=None,
     ):
+        """Run one agent task and check its completion events and declared safety refusals."""
+
         if role not in SANDBOXES or not task.strip():
             raise ValueError("Supported role and nonempty task required")
         if ticket_id is not None and (
@@ -129,6 +142,19 @@ class AgentRunner:
             "sandbox_workspace_write.exclude_slash_tmp=true",
         ):
             args += ["-c", setting]
+        shell_env = {
+            key: value
+            for key, value in self.environment().items()
+            if key != "CODEX_HOME"
+        }
+        args += [
+            "-c",
+            "shell_environment_policy.set={"
+            + ", ".join(
+                f"{key}={json.dumps(value)}" for key, value in shell_env.items()
+            )
+            + "}",
+        ]
         if output_schema:
             schema = self.audit.path.parent / "schemas" / "review.json"
             atomic_json(schema, output_schema)
@@ -182,6 +208,8 @@ class AgentRunner:
             else:
                 result.status = "success"
         result.text = final_message(result.stdout)
+        if result.text.lstrip().startswith(SAFETY_REFUSAL):
+            result.status, result.error = "failed", "security_policy_violation"
         result.duration = time.monotonic() - started
         self.audit.write(
             **metadata,

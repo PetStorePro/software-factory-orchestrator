@@ -1,4 +1,4 @@
-"""Durable local state, advisory serial lock and graceful stop marker."""
+"""Save Issue progress and prevent local factory processes from running together."""
 
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, fields
@@ -21,6 +21,8 @@ def utcnow():
 
 
 def atomic_json(path: Path, value):
+    """Write a complete temporary JSON file before replacing the saved version."""
+
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=".state-")
     try:
@@ -41,7 +43,7 @@ def atomic_json(path: Path, value):
 
 @contextmanager
 def execution_lock():
-    """One factory/legacy runner per local OS user, even with different runtime roots."""
+    """Allow only one factory or local agent command per user on this machine."""
     path = Path(tempfile.gettempdir()) / f"software-factory-{os.getuid()}.lock"
     fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "a") as stream:
@@ -59,7 +61,10 @@ def execution_lock():
 
 @dataclass
 class WorkflowState:
+    """Hold the saved progress and identifiers for one Issue."""
+
     issue: int
+    base_branch: str = "main"
     run_id: str = field(default_factory=lambda: str(uuid4()))
     status: str = "CLAIMED"
     branch: str = ""
@@ -71,6 +76,7 @@ class WorkflowState:
     feedback: dict = field(default_factory=dict)
     review_file: str = ""
     ci_started: float = 0
+    ci_status: str = "not_checked"
     issue_data: dict = field(default_factory=dict)
     urls: dict = field(default_factory=dict)
     reason: str | None = None
@@ -79,6 +85,8 @@ class WorkflowState:
 
 
 class StateManager:
+    """Read and save Issue progress and manage the local stop request."""
+
     def __init__(self, root: Path, repository: str):
         self.root = root
         self.repository = repository
@@ -93,7 +101,9 @@ class StateManager:
             raise FactoryError("runtime_belongs_to_another_repository")
 
     @contextmanager
-    def lock(self):  # TODO
+    def lock(self):
+        """Lock local execution and check that this runtime belongs to the selected repository."""
+
         with execution_lock():
             owner = self.root / "repository.json"
             if (
@@ -110,6 +120,8 @@ class StateManager:
         atomic_json(self.root / "states" / f"issue-{state.issue}.json", asdict(state))
 
     def all(self):
+        """Read saved Issue files and build states using the fields this version understands."""
+
         known = {f.name for f in fields(WorkflowState)}
         return [
             WorkflowState(

@@ -1,147 +1,119 @@
 # The Software Factory
 
-A project that turns
-GitHub Issues into tested, independently AI-reviewed Pull Requests. A local Python
-process on macOS coordinates Developer and Reviewer agents through the installed
-Codex CLI, using existing ChatGPT authentication.
+It runs locally on macOS, using Python and Codex CLI with your existing ChatGPT login. No Docker, OpenAI API key or extra paid service is needed.
 
-**The factory stops at `READY_FOR_HUMAN_REVIEW`. It never merges or deploys.**
-Human review, merge, production approval and deployment belong to the target
-Petstore repository and GitHub. A real human-approved production deployment is
-still required to complete M1; a reviewed PR alone does not complete it.
+**The factory never merges or deploys. A human takes over after AI review.**
 
-## Workflow and responsibilities
+## How it works
 
 ```text
-Oldest ai-ready Issue → feature branch from latest main → Developer → commit/PR
-       → GitHub Actions CI → fresh, read-only Reviewer → human handoff
-              ↑ errors          │ findings
-              └──── Developer repair in the same PR ──┘
+Oldest ai-ready Issue
+        ↓
+Feature branch → Developer → Commit, push and PR
+                                 ↓
+                             CI checks
+                                 ↓
+                         Independent Reviewer
+                                 ↓
+                       READY_FOR_HUMAN_REVIEW
+                                 ↓
+                Human review → Merge → Approved deployment
 ```
 
-The orchestrator processes one Issue and runs one agent at a time. It handles
-branches, commits, pushes, PRs, CI results, local feedback and COMMENT reviews.
-CI failures go back to the Developer with available error summaries/annotations.
-Review findings are saved locally and drive the repair loop without fetching PR
-comments. Each fix is checked by CI and a fresh independent reviewer.
+If CI fails or the Reviewer asks for changes, the Developer repairs the code in the same PR. CI and review run again, within configured limits.
 
-Only current-commit CI success plus an `approved` review allows the final positive
-COMMENT and the `READY_FOR_HUMAN_REVIEW` label/state. AI approval is advisory; it is
-never a formal GitHub APPROVE. The Issue stays open, the factory moves to the next
-Issue, and a human takes over. Blocked Issues also release the queue slot.
+Only one Issue and one agent run at a time. Reviews are posted as COMMENT reviews, with inline comments where possible. AI approval does not replace human approval.
 
-| Orchestrator | Petstore / GitHub |
-| --- | --- |
-| Issue queue, agents, feature commits/PRs, repair loops | Application and automated tests |
-| Observe configured CI checks on the current SHA | CI/security workflows, specialized secret scanning, dependency checks |
-| Independent review comments and human handoff | Branch protection, required human PR reviews and merge |
-| Local audit and safe recovery | Protected production Environment, secrets, human approval and deployment |
+The target repository owns the application, CI/CD, branch protection, human reviews and production approval. The factory coordinates the work and reads CI results for the current commit.
 
-## Architecture
+## Setup
 
-- `workflow.py`: the serial workflow and bounded CI/review repair loops.
-- `agents/` and `agent_runner.py`: small provider contract and shared Codex runner.
-  Developer/reviewer providers are selected independently; only Codex is implemented.
-- `git_manager.py`: host-owned Git operations and clean source exports without `.git`.
-- `github_client.py`, `review_manager.py`: GitHub CLI/REST, validated JSON reviews,
-  inline comments on changed lines, and publication receipts.
-- `state_manager.py`, `audit_logger.py`, `process.py`: atomic JSON checkpoints,
-  local execution lock, audit records, timeouts and process-group cancellation.
-- `security.py`: local protected-path and heuristic secret checks before publication.
+Install Python 3.14, Git, GitHub CLI and Codex CLI. Authenticate GitHub CLI for the target repository and Codex through ChatGPT.
 
-## Setup and configuration
-
-Install Python 3.14, Git, `gh` and a Codex CLI supporting the documented execution
-flags. Authenticate `gh` for the target repository and Codex with ChatGPT normally;
-your existing local login is reused. Do not put tokens in configuration or prompts.
+From this repository:
 
 ```bash
 python3.14 -m venv .venv
 source .venv/bin/activate
-python -m unittest discover -v
 gh auth status
 codex login status
+```
+
+Copy the example **only if you do not already have `.env`**:
+
+```bash
 cp .env.example .env
-# Edit the trusted local .env, then export it:
+```
+
+Edit it for your repository, branch and CI check names. The example targets `PetStorePro/pet-store-web-app` on `main`. Its required checks are `backend`, `frontend`, `dependency-review`, `backend-image` and `frontend-image`. CI skipping is disabled.
+
+Create these labels in the target repository:
+
+```text
+ai-ready · ai-in-progress · ai-review · ai-blocked · READY_FOR_HUMAN_REVIEW
+```
+
+Load your trusted local configuration in each terminal you use:
+
+```bash
 set -a
 source .env
 set +a
 ```
 
-`.env` is ignored by Git and is not loaded automatically. Never source a target
-repository's configuration. Run commands from this repository root.
+This exports the settings so Python can read them. The factory does not load `.env` automatically. Keep credentials out of it.
 
-| Variable | Default / purpose |
-| --- | --- |
-| `GITHUB_REPOSITORY` | Required `owner/repository`, such as `PetStorePro/petstore` |
-| `GITHUB_ISSUE_LABEL` | `ai-ready` |
-| `AI_DEVELOPER_PROVIDER`, `AI_REVIEWER_PROVIDER` | Independently selected; `codex` only for now |
-| `REQUIRED_CHECKS` | `ci,security`; actual, unique GitHub Actions check names |
-| `FACTORY_RUNTIME` | `~/.software-factory/m1`, outside this checkout |
-| `POLL_INTERVAL_SECONDS` | `30` |
-| `AGENT_TIMEOUT_SECONDS`, `CI_TIMEOUT_SECONDS` | `600`, `1800` |
-| `MAX_CI_FIX_ATTEMPTS`, `MAX_REVIEW_CYCLES` | `2`, `3` total per Issue |
+## Run
 
-The target must have `main` and these labels: `ai-ready` (or the configured
-eligibility label), `ai-in-progress`, `ai-review`, `ai-blocked`, and
-`READY_FOR_HUMAN_REVIEW`. The factory does not configure GitHub protections.
-
-## Commands
+Check the setup and see eligible Issues without running agents or changing GitHub:
 
 ```bash
 python -m orchestrator.main preflight
 python -m orchestrator.main once --dry-run
-python -m orchestrator.main once
-python -m orchestrator.main watch
-python -m orchestrator.main status
-python -m orchestrator.main stop
-python -m orchestrator.main retry --issue 12
 ```
 
-Preflight checks repository access, default `main`, labels, local Codex flags and
-login status. Dry-run also lists eligible Issues. Both perform read-only GitHub
-requests and no model calls; neither certifies GitHub branch/environment security.
-`once` resumes one interrupted active workflow before claiming new work; `watch`
-polls continuously. Use the same persistent runtime directory for the queue.
-`stop` requests cancellation and stops the recorded agent process group; Ctrl-C
-also requests shutdown. A local lock prevents concurrent factory/agent CLI runs.
+These checks do not verify branch protection or production approval.
 
-`retry` resumes a blocked checkpoint after investigation, without resetting
-limits or bypassing checks. Potential-secret rejections require a new sanitized
-Issue. Unsupported older checkpoints block rather than guessing how to resume;
-back up runtime data before upgrading. CLI exit 0 means the attempt/control command
-finished (possibly blocked); inspect `status` for the Issue result. Exit 2 indicates
-configuration/control failure.
-
-A standalone task remains available:
+Add `ai-ready` to a small, clear Issue, then start real work:
 
 ```bash
-mkdir -p /tmp/factory-demo
-python -m orchestrator.main run --role developer \
-  --task 'Create a README file' --workspace /tmp/factory-demo
+python -m orchestrator.main once
 ```
 
-Use `--role reviewer` for read-only access. Its exit codes are 0 completed, 1
-agent failure, 2 invalid input, 124 timeout, and 127 missing executable. A successful
-process alone does not verify correctness (`task_verified=false`).
+**This can create commits, push a feature branch, open a PR and publish reviews.** It prints short progress messages in English.
 
-## Feedback, recovery and security
+| Command after `python -m orchestrator.main` | Purpose |
+| --- | --- |
+| `watch` | Keep processing Issues, one at a time. |
+| `status` | Show saved progress and results. |
+| `stop` | Request shutdown and stop the managed agent. |
+| `retry --issue 1` | Reactivate eligible blocked work; then run `once`. |
+| `run --role developer --task "..." --workspace /path` | Run a separate local agent task; also supports `reviewer`. |
 
-Runtime holds `states/`, host-only `checkouts/`, agent `workspaces/`, and
-`audit.jsonl`. Reviews are immutable files such as
-`runs/issue-12/pr-34/review-1.json`, tied to the exact commit SHA. Publication receipts
-and stable review IDs prevent routine duplicate comments after interruption.
-Commit markers and branch/PR lookup prevent duplicate commits/PRs. Interrupted
-agent work restarts from committed source; do not erase state to reclaim a branch.
+A command finishing normally does not mean the Issue succeeded. Check `status`: the expected final state is `READY_FOR_HUMAN_REVIEW`. A problem leaves it `BLOCKED`, with a reason.
 
-Developer uses `workspace-write`; Reviewer uses `read-only`, fresh context and
-validated JSON output. Agents receive no forwarded GitHub/API tokens or SSH agent
-variables. The orchestrator performs authenticated Git operations; source exports
-exclude Git metadata and authorization instructions. Protected paths and suspected
-secrets block publication. All Issue/CI/review content remains untrusted input.
+## Settings and saved data
 
-**Local sandboxing is not credential isolation.** Standard Codex sandboxes may
-read files outside the workspace, including credential stores belonging to the
-same macOS user. Filtering environment variables does not prevent that. Use only
-controlled tasks and least-privilege target credentials; stronger isolation needs
-a separate execution identity/machine that this project does not provision.
+[.env.example](.env.example) lists the settings: target repository, base branch, separate agent providers, required CI checks, timeouts and retry limits. Only the `codex` provider is implemented.
+
+For a temporary demo, `ALLOW_MISSING_CI=true` skips CI only when there are no check runs and no workflow YAML files on the base branch. It does not ignore failed or pending checks. Reviews carry a **CI SKIPPED** warning. Restore `false` when CI is ready.
+
+`FACTORY_RUNTIME` holds saved state, working copies, `audit.jsonl` and reports such as `runs/issue-1/pr-2/review-1.json`. Its default is `~/.software-factory/m1`.
+
+Keep the same runtime to resume interrupted work and avoid duplicate operations. Do not delete state to force a restart. Back it up before upgrades.
+
+## Safety and limits
+
+Developer uses `workspace-write`; Reviewer starts fresh with `read-only` access. The orchestrator handles GitHub authentication and does not forward token variables to agents. Sensitive file changes, suspected secrets and declared safety refusals block publication.
+
+**Local sandboxing does not fully isolate credentials.** Agents may read files accessible to the same macOS user. Prompts and simple secret checks cannot catch every attack. Use controlled Issues and limited GitHub permissions.
+
+## Tests and code
+
+```bash
+python -m unittest discover -v
+```
+
+Tests use fakes and mocks: no real model calls or GitHub writes.
+
+`workflow.py` coordinates the steps; `agents/` runs providers; `git_manager.py` and `github_client.py` handle repositories; review, state, audit and security modules keep results and enforce local checks.

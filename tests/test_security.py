@@ -1,3 +1,5 @@
+"""Check publication rules, process control and recovery with fake services."""
+
 import json
 from pathlib import Path
 import tempfile
@@ -15,6 +17,8 @@ from orchestrator.security import validate_changes
 
 
 class SecurityTests(unittest.TestCase):
+    """Check important safety rules and recovery behavior without external writes."""
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -144,6 +148,7 @@ class SecurityTests(unittest.TestCase):
             "sha": "current",
             "verdict": "changes_requested",
             "summary": "Missing test.",
+            "ci_status": "skipped",
             "findings": [
                 {
                     "file": "a.txt",
@@ -173,6 +178,7 @@ class SecurityTests(unittest.TestCase):
             self.assertEqual(final_payload["event"], "COMMENT")
             self.assertEqual(final_payload["comments"], [])
             self.assertIn("Add test.", final_payload["body"])
+            self.assertIn("CI SKIPPED", final_payload["body"])
 
     def test_single_process_lock_and_unsupported_provider(self):
         from orchestrator.agents import create_provider
@@ -202,3 +208,93 @@ class SecurityTests(unittest.TestCase):
                 with self.assertRaises(FactoryError):
                     execute(["codex", "exec"], timeout=timeout, stop=stop)
                 kill.assert_called_once_with(process.pid, signal.SIGKILL)
+
+    def test_configured_base_fetch_checkout_and_pr_keep_feature_only_push(self):
+        from dataclasses import replace
+
+        base = "pvieru_AddBackendScaffoldAndCompose"
+        config = replace(self.config, base_branch=base)
+        state = WorkflowState(1, base_branch=base, branch="ai/issue-1")
+        manager = GitManager(config, self.audit)
+        manager.paths(state)[0].mkdir(parents=True)
+
+        def result(state, command, *args, **kwargs):
+            return (
+                "https://github.com/test/app.git"
+                if command == "remote"
+                else "abc" if command == "rev-parse" else ""
+            )
+
+        with patch.object(manager, "git", side_effect=result) as git:
+            manager.prepare(state)
+            manager.push(state)
+            git.assert_any_call(
+                state,
+                "fetch",
+                "--no-tags",
+                "origin",
+                f"+refs/heads/{base}:refs/remotes/origin/{base}",
+            )
+            git.assert_any_call(state, "checkout", "-b", state.branch, f"origin/{base}")
+            git.assert_any_call(state, "push", "origin", "HEAD:refs/heads/ai/issue-1")
+        github = GitHubClient("test/app", self.audit)
+        with (
+            patch.object(github, "find_pr", return_value=None),
+            patch.object(github, "api") as api,
+        ):
+            github.create_pr(state)
+            self.assertEqual(api.call_args.args[2]["base"], base)
+        state.base_branch = state.branch
+        with self.assertRaises(FactoryError):
+            manager.push(state)
+        for invalid in (
+            "../main",
+            "-main",
+            "main:other",
+            "main\nother",
+            "a//b",
+            "a.lock",
+        ):
+            with self.subTest(branch=invalid), self.assertRaises(ValueError):
+                replace(config, base_branch=invalid)
+
+    def test_maven_outputs_are_not_imported_as_source_changes(self):
+        from orchestrator.state_manager import atomic_json
+
+        manager = GitManager(self.config, self.audit)
+        state = WorkflowState(1, branch="ai/issue-1")
+        source = manager.workspace(state)
+        output = source / "backend/target/classes"
+        output.mkdir(parents=True)
+        (output / "Generated.class").write_bytes(b"compiled output")
+        atomic_json(self.config.runtime / "manifests/issue-1.json", {})
+        self.assertEqual(manager.changes(state), {})
+
+    def test_missing_ci_is_distinct_from_wrong_check_names_and_api_errors(self):
+        from orchestrator.github_client import GitHubError
+
+        github = GitHubClient("test/app", self.audit)
+        with patch.object(github, "listing", return_value=[]):
+            self.assertEqual(
+                github.checks("sha", ("ci",))["ci"]["reason"], "no_check_runs"
+            )
+        with patch.object(github, "listing", return_value=[{"name": "other"}]):
+            self.assertNotEqual(
+                github.checks("sha", ("ci",))["ci"]["reason"], "no_check_runs"
+            )
+        for code in (404, 403):
+            with patch.object(github, "get", side_effect=GitHubError(code)):
+                if code == 404:
+                    self.assertFalse(github.has_workflows("main"))
+                else:
+                    with self.assertRaises(GitHubError):
+                        github.has_workflows("main")
+
+    def test_reviewer_safety_refusal_is_not_published_or_treated_as_approval(self):
+        report = {
+            "verdict": "failed",
+            "summary": "FACTORY_SECURITY_BLOCKED: Unsafe request.",
+            "findings": [],
+        }
+        with self.assertRaisesRegex(FactoryError, "security_policy_violation"):
+            validate_report(json.dumps(report))

@@ -1,10 +1,12 @@
-"""Thin local Codex adapter; all subprocess behavior lives in AgentRunner."""
+"""Connect the shared agent interface to the local Codex runner."""
 
 from ..agent_runner import AgentRunner
 from ..config import Config
 
 
 class CodexProvider:
+    """Pass agent requests to the shared Codex runner."""
+
     name = "codex"
 
     def __init__(self, config, audit, stop):

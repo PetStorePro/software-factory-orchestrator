@@ -1,4 +1,4 @@
-"""GitHub REST adapter via authenticated gh. No token extraction or shell use."""
+"""Use GitHub CLI to read Issues and CI results and publish PRs and reviews."""
 
 import json
 from urllib.parse import quote, urlencode
@@ -8,6 +8,8 @@ from .security import scan_secret
 
 
 class GitHubError(FactoryError):
+    """Report a GitHub request failure with its HTTP status when available."""
+
     def __init__(self, http_status=None):
         super().__init__("github_request_failed")
         self.http_status = http_status
@@ -23,6 +25,8 @@ LABELS = {
 
 
 class GitHubClient:
+    """Handle GitHub requests through the existing GitHub CLI login."""
+
     def __init__(self, repository, audit, stop=lambda: False):
         self.repository, self.audit, self.stop = repository, audit, stop
         self.prefix = f"repos/{repository}"
@@ -32,6 +36,8 @@ class GitHubClient:
         self.run_id, self.ticket_id = state.run_id, f"issue-{state.issue}"
 
     def api(self, endpoint, method="GET", payload=None, *, pages=False):
+        """Run a GitHub API request and return parsed JSON while recording safe audit details."""
+
         args = [
             "gh",
             "api",
@@ -88,6 +94,8 @@ class GitHubClient:
         return self.api(f"{self.prefix}/{path}", **kwargs)
 
     def listing(self, path, key=None):
+        """Read every result page and combine the items into one list."""
+
         pages = self.get(
             path + ("&" if "?" in path else "?") + "per_page=100", pages=True
         )
@@ -112,7 +120,9 @@ class GitHubClient:
         ]
 
     def label(self, number, label, ready_label="ai-ready"):
-        # Add desired state first; do not overwrite unrelated labels or concurrent human changes.
+        # Add the new stage first and keep labels that do not belong to the factory.
+        """Set the factory stage label while keeping labels managed by other people."""
+
         existing = {item["name"] for item in self.get(f"issues/{number}/labels")}
         if label not in existing:
             self.api(
@@ -142,7 +152,7 @@ class GitHubClient:
             {
                 "title": f"Implement issue #{state.issue}",
                 "head": state.branch,
-                "base": "main",
+                "base": state.base_branch,
                 "body": f"Relates to #{state.issue}.\n\nSoftware Factory run `{state.run_id}`.\n"
                 "AI-generated implementation; independent AI review is not human approval.",
                 "maintainer_can_modify": False,
@@ -165,13 +175,20 @@ class GitHubClient:
         ]
 
     def checks(self, sha, required):
+        """Read required checks for this exact commit and collect safe failure details."""
+
         runs = self.listing(f"commits/{sha}/check-runs?filter=latest", "check_runs")
         results = {}
         for name in required:
             matches = [r for r in runs if r["name"] == name]
             if len(matches) != 1:
                 results[name] = {
-                    "state": "missing"
+                    "state": "missing",
+                    "reason": (
+                        "no_check_runs"
+                        if not runs
+                        else "required_check_missing_or_ambiguous"
+                    ),
                 }  # Duplicate names are ambiguous too.
                 continue
             run = matches[0]
@@ -198,7 +215,24 @@ class GitHubClient:
             }
         return results
 
+    def has_workflows(self, branch):
+        """Check for workflow YAML files on the selected branch without hiding API errors."""
+        try:
+            entries = self.get(
+                "contents/.github/workflows?" + urlencode({"ref": branch})
+            )
+        except GitHubError as error:
+            if error.http_status == 404:
+                return False
+            raise
+        return any(
+            entry.get("type") == "file" and entry["name"].endswith((".yml", ".yaml"))
+            for entry in entries
+        )
+
     def publish_review(self, pr, report, inline, *, retry=True):
+        """Publish a COMMENT review and look for an existing copy when retrying."""
+
         marker = f'<!-- software-factory-review:{report["review_id"]} -->'
         reviews = self.listing(f"pulls/{pr}/reviews") if retry else []
         for existing in reviews:
@@ -212,6 +246,8 @@ class GitHubClient:
             for f in report["findings"]
         )
         body = f'{marker}\nAI verdict: **{report["verdict"]}** (not human approval).\n\n{report["summary"]}\n\n{findings}'
+        if report.get("ci_status") == "skipped":
+            body += "\n\n**CI SKIPPED — explicit test mode. No automated CI checks were verified; this is not M1 completion.**"
         if len(body) > 60000:
             raise FactoryError("review_too_large_to_publish")
         try:
@@ -228,7 +264,7 @@ class GitHubClient:
         except GitHubError as error:
             if inline and error.http_status == 422:
                 # GitHub rejected inline attachment. All findings already exist in the body.
-                # Reconcile marker first before attempting a general-only COMMENT.
+                # Check for an existing review before posting the summary without inline comments.
                 return self.publish_review(pr, report, [])
             raise
         return {"id": result["id"], "url": result.get("html_url")}

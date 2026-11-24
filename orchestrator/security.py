@@ -1,10 +1,12 @@
-"""Publication policy enforced on byte content, never on agent assertions."""
+"""Check file paths and content for protected files and possible secrets."""
 
 import fnmatch
 from pathlib import PurePosixPath
 import re
 
 from .process import FactoryError
+
+SAFETY_REFUSAL = "FACTORY_SECURITY_BLOCKED"
 
 PROTECTED = (
     ".github/**",
@@ -44,6 +46,8 @@ SECRET = re.compile(
 
 
 def safe_path(value):
+    """Reject absolute paths and attempts to leave the repository folder."""
+
     path = PurePosixPath(value)
     if (
         not value
@@ -57,11 +61,15 @@ def safe_path(value):
 
 
 def scan_secret(data):
+    """Reject content matching known secret patterns. This does not detect every secret."""
+
     if SECRET.search(data):
         raise FactoryError("potential_secret_detected")
 
 
 def validate_changes(changes, extra=()):
+    """Reject protected paths and detected secrets before changes are published."""
+
     for name, content in changes.items():
         safe_path(name)
         if any(

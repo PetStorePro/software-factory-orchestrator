@@ -1,4 +1,4 @@
-"""Metadata-only JSONL logging. Callers must never pass model text."""
+"""Save local audit events without raw prompts or agent responses."""
 
 from datetime import datetime, timezone
 import json
@@ -7,10 +7,14 @@ from pathlib import Path
 
 
 class AuditLogger:
+    """Append audit events to a local JSONL file. Each line is one event."""
+
     def __init__(self, path: Path):
         self.path = path.expanduser().resolve()
 
     def write(self, **event):
+        """Append one event with a UTC timestamp and request that it be saved to disk."""
+
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         event["timestamp"] = datetime.now(timezone.utc).isoformat()
         data = (json.dumps(event, ensure_ascii=True) + "\n").encode()

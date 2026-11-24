@@ -1,4 +1,4 @@
-"""Bounded host commands; diagnostics never include credentials or raw output."""
+"""Run external commands with time limits and support stopping managed agents."""
 
 import os
 import re
@@ -8,10 +8,12 @@ import time
 
 
 class FactoryError(RuntimeError):
-    """A safe, fixed diagnostic suitable for audit records."""
+    """Report a controlled error that can be recorded without raw command output."""
 
 
 class CommandError(FactoryError):
+    """Keep the exit code and captured output of a failed command."""
+
     def __init__(self, returncode, stderr, stdout=""):
         super().__init__("command_failed")
         self.returncode = returncode
@@ -21,12 +23,16 @@ class CommandError(FactoryError):
 
 
 class Stopped(FactoryError):
+    """Signal that the user requested shutdown."""
+
     pass
 
 
 def execute(
     args, *, cwd=None, data=None, timeout=60, env=None, stop=None, pid_file=None
 ):
+    """Run a command and check for shutdown or timeout while collecting its output."""
+
     started = time.monotonic()
     try:
         with subprocess.Popen(
@@ -79,7 +85,7 @@ def execute(
 
 
 def process_identity(pid):
-    """Start time, group and UID only; never command arguments or environment."""
+    """Read process start time, group and owner without inspecting arguments or secrets."""
     try:
         result = subprocess.run(
             ["/bin/ps", "-p", str(pid), "-o", "lstart=", "-o", "pgid=", "-o", "uid="],
@@ -99,7 +105,7 @@ def process_identity(pid):
 
 
 def stop_agent(pid_file):
-    """Stop only the recorded process group with the same birth time and owner."""
+    """Stop the recorded agent group only when its process identity can be verified."""
     import json
 
     if not pid_file.exists():

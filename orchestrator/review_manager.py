@@ -1,4 +1,4 @@
-"""Strict review validation, immutable artifacts and retry-safe COMMENT publication."""
+"""Check review reports, save them locally and publish comments on GitHub."""
 
 import json
 import re
@@ -6,7 +6,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from .process import FactoryError
-from .security import safe_path, scan_secret
+from .security import SAFETY_REFUSAL, safe_path, scan_secret
 from .state_manager import utcnow, atomic_json
 
 REVIEW_SCHEMA = {
@@ -41,6 +41,8 @@ REVIEW_SCHEMA = {
 
 
 def validate_report(text):
+    """Accept only a valid review with safe paths and no detected secrets."""
+
     if len(text) > 100000:
         raise FactoryError("review_report_too_large")
     scan_secret(text.encode())
@@ -58,6 +60,8 @@ def validate_report(text):
             raise ValueError()
         if not isinstance(data["findings"], list) or len(data["findings"]) > 50:
             raise ValueError()
+        if data["summary"].lstrip().startswith(SAFETY_REFUSAL):
+            raise FactoryError("security_policy_violation")
         for finding in data["findings"]:
             if set(finding) != {"file", "line", "severity", "message"}:
                 raise ValueError()
@@ -80,6 +84,8 @@ def validate_report(text):
 
 
 def changed_lines(files):
+    """Find added lines in the new file version that can receive inline comments."""
+
     valid = set()
     for file in files:
         name, patch = file["filename"], file.get("patch", "")
@@ -97,6 +103,8 @@ def changed_lines(files):
 
 
 class ReviewManager:
+    """Keep review reports and publication records tied to the commit that was reviewed."""
+
     def __init__(self, root, github):
         self.root, self.github = root, github
 
@@ -106,6 +114,8 @@ class ReviewManager:
         return legacy if legacy.exists() else directory / f"review-{cycle}.json"
 
     def save(self, state, result, provider):
+        """Validate the response and save a new report without replacing previous reports."""
+
         data = validate_report(result.text)
         path = self.path(state, state.review_cycle)
         if path.exists():
@@ -120,6 +130,7 @@ class ReviewManager:
             provider=provider,
             session_id=result.session_id,
             sha=state.sha,
+            ci_status=state.ci_status,
             timestamp=utcnow(),
             publication={"status": "pending"},
         )
@@ -133,6 +144,8 @@ class ReviewManager:
         return json.loads(resolved.read_text())
 
     def publish(self, state):
+        """Attach valid inline comments and save a separate record of GitHub publication."""
+
         report = self.load(state.review_file)
         publication_path = Path(state.review_file).with_suffix(".publication.json")
         if (
@@ -159,6 +172,6 @@ class ReviewManager:
         ]
         atomic_json(publication_path, {"status": "publishing"})
         result = self.github.publish_review(state.pr, report, inline, retry=retry)
-        # Keep original reports immutable; publication receipts are separate durable artifacts.
+        # Keep the original report unchanged and save publication details in a separate file.
         atomic_json(publication_path, dict(status="published", **result))
         return report

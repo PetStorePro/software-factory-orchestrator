@@ -1,4 +1,4 @@
-"""Shared local execution: restrictions, output, failures and CLI compatibility."""
+"""Check agent execution, restrictions and failures without starting Codex."""
 
 import json
 import os
@@ -27,6 +27,8 @@ OUTPUT = "\n".join(
 
 
 class RunnerTests(unittest.TestCase):
+    """Check the agent runner using recorded events and mocked commands."""
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -68,6 +70,7 @@ class RunnerTests(unittest.TestCase):
                     "GITHUB_TOKEN": "dummy",
                     "SSH_AUTH_SOCK": "/dummy",
                     "OPENAI_API_KEY": "dummy",
+                    "JAVA_HOME": "/test/java-21",
                 },
             ):
                 result = self.runner.run(
@@ -90,6 +93,14 @@ class RunnerTests(unittest.TestCase):
                 & kwargs["env"].keys()
             )
             self.assertEqual(kwargs["timeout"], 2)
+            self.assertEqual(kwargs["env"]["JAVA_HOME"], "/test/java-21")
+            self.assertTrue(
+                any(
+                    arg.startswith("shell_environment_policy.set=")
+                    and "/test/java-21" in arg
+                    for arg in command
+                )
+            )
         records = [json.loads(line) for line in self.audit.read_text().splitlines()]
         self.assertEqual(
             [r["status"] for r in records], ["started", "success", "started", "success"]
@@ -137,3 +148,18 @@ class RunnerTests(unittest.TestCase):
             ):
                 self.assertEqual(main(args), 127)
             self.assertEqual(main(args + ["--timeout", "-1"]), 2)
+
+    def test_declared_safety_refusal_cannot_count_as_success_or_leak_output(self):
+        output = OUTPUT.replace(
+            "Finished.", "FACTORY_SECURITY_BLOCKED: PRIVATE_AGENT_TEXT"
+        )
+        with (
+            patch("orchestrator.agent_runner.execute", return_value=output),
+            patch("builtins.print") as print_call,
+        ):
+            result = self.runner.run("developer", "task", self.workspace)
+        self.assertEqual(
+            (result.status, result.error), ("failed", "security_policy_violation")
+        )
+        print_call.assert_not_called()
+        self.assertNotIn("PRIVATE_AGENT_TEXT", self.audit.read_text())

@@ -1,4 +1,4 @@
-"""Small environment-based configuration; never loaded from target source files."""
+"""Read local settings and check that work folders stay separate from control files."""
 
 from dataclasses import dataclass, field
 import math
@@ -12,6 +12,8 @@ SANDBOXES = {"developer": "workspace-write", "reviewer": "read-only"}
 
 @dataclass(frozen=True)
 class Config:
+    """Store the timeout and audit path for a local agent task."""
+
     timeout: float = 300
     audit_path: Path = field(
         default_factory=lambda: Path.home() / ".software-factory/audit.jsonl"
@@ -27,6 +29,8 @@ def overlaps(a, b):
 
 
 def validate_workspace(workspace, audit_path):
+    """Require an existing work folder separate from policies, login files and audit logs."""
+
     workspace = Path(workspace).expanduser().resolve(strict=True)
     auth = (
         Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
@@ -47,12 +51,16 @@ def validate_workspace(workspace, audit_path):
 
 @dataclass(frozen=True)
 class FactoryConfig:
+    """Store and validate settings for the Issue processing workflow."""
+
     repository: str
+    base_branch: str = "main"
     runtime: Path = field(default_factory=lambda: Path.home() / ".software-factory/m1")
     issue_label: str = "ai-ready"
     developer_provider: str = "codex"
     reviewer_provider: str = "codex"
     required_checks: tuple[str, ...] = ("ci", "security")
+    allow_missing_ci: bool = False
     poll_interval: int = 30
     agent_timeout: int = 600
     ci_timeout: int = 1800
@@ -60,6 +68,17 @@ class FactoryConfig:
     max_review_cycles: int = 3
 
     def __post_init__(self):
+        if (
+            not re.fullmatch(
+                r"[A-Za-z0-9_][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_][A-Za-z0-9_.-]*)*",
+                self.base_branch,
+            )
+            or ".." in self.base_branch
+            or any(
+                part.endswith((".", ".lock")) for part in self.base_branch.split("/")
+            )
+        ):
+            raise ValueError("BASE_BRANCH must be a valid branch name")
         if not re.fullmatch(
             r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9_.-]*", self.repository
         ):
@@ -91,6 +110,7 @@ class FactoryConfig:
             name: os.environ[env]
             for name, env in (
                 ("repository", "GITHUB_REPOSITORY"),
+                ("base_branch", "BASE_BRANCH"),
                 ("issue_label", "GITHUB_ISSUE_LABEL"),
                 ("developer_provider", "AI_DEVELOPER_PROVIDER"),
                 ("reviewer_provider", "AI_REVIEWER_PROVIDER"),
@@ -98,6 +118,10 @@ class FactoryConfig:
             if env in os.environ
         }
         values["repository"] = values.get("repository", "")
+        allow_missing_ci = os.environ.get("ALLOW_MISSING_CI", "false").lower()
+        if allow_missing_ci not in ("true", "false"):
+            raise ValueError("ALLOW_MISSING_CI must be true or false")
+        values["allow_missing_ci"] = allow_missing_ci == "true"
         if "FACTORY_RUNTIME" in os.environ:
             values["runtime"] = Path(os.environ["FACTORY_RUNTIME"])
         if "REQUIRED_CHECKS" in os.environ:
