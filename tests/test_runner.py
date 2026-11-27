@@ -11,6 +11,7 @@ from orchestrator.agent_runner import AgentRunner, final_message, parse_events
 from orchestrator.config import Config
 from orchestrator.main import main
 from orchestrator.process import CommandError, FactoryError
+from orchestrator.state_manager import StateManager, WorkflowState, atomic_json
 
 SESSION = "550e8400-e29b-41d4-a716-446655440000"
 OUTPUT = "\n".join(
@@ -37,6 +38,27 @@ class RunnerTests(unittest.TestCase):
         self.workspace.mkdir()
         self.audit = self.root / "logs" / "audit.jsonl"
         self.runner = AgentRunner(Config(2, self.audit))
+
+    def test_status_shows_stop_and_verified_agent_without_changing_issue_stage(self):
+        runtime = self.root / "runtime"
+        states = StateManager(runtime, "test/app")
+        state = WorkflowState(1, status="IMPLEMENTING")
+        states.save(state)
+        with patch.dict(os.environ, {"GITHUB_REPOSITORY": "test/app", "FACTORY_RUNTIME": str(runtime)}):
+            for running in (True, False, None):
+                states.request_stop()
+                record = runtime / "agent-process.json"
+                if running is False:
+                    record.unlink(missing_ok=True)
+                else:
+                    atomic_json(record, {"pid": 12345, "identity": "recorded identity"})
+                with patch("orchestrator.process.process_identity", return_value="recorded identity" if running else ""), patch("builtins.print") as output:
+                    self.assertEqual(main(["status"]), 0)
+                result = json.loads(output.call_args.args[0])
+                self.assertTrue(result["stop_requested"])
+                self.assertIs(result["agent_running"], running)
+                self.assertEqual(result["issues"][0]["status"], "IMPLEMENTING")
+                self.assertEqual(result["issues"][0]["feedback"], "[omitted]")
 
     def test_event_output_is_untrusted_and_completion_is_not_verification(self):
         session, usage, completed, failed = parse_events(OUTPUT + "\nnull\nnot JSON")

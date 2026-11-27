@@ -4,7 +4,7 @@ import json
 import time
 
 from .agents.base import AgentRequest
-from .process import FactoryError
+from .process import FactoryError, Stopped
 from .review_manager import REVIEW_SCHEMA, ReviewManager
 from .security import scan_secret, validate_changes
 from .state_manager import INACTIVE, READY, WorkflowState
@@ -48,14 +48,24 @@ class Workflow:
         self.github.label(state.issue, label, self.config.issue_label)
 
     def verify_pr(self, state):
-        pr = self.github.pr(state.pr)
-        if (
-            pr["state"] != "open"
-            or pr["head"]["sha"] != state.sha
-            or pr["head"]["ref"] != state.branch
-            or pr["base"]["ref"] != state.base_branch
-        ):
-            raise FactoryError("pr_changed_outside_factory")
+        """Allow a short delay for GitHub to show a pushed commit before rejecting a mismatch."""
+
+        for attempt in range(3):
+            if self.states.stopped():
+                raise Stopped("shutdown_requested")
+            pr = self.github.pr(state.pr)
+            if (
+                pr["state"] != "open"
+                or pr["head"]["ref"] != state.branch
+                or pr["base"]["ref"] != state.base_branch
+            ):
+                raise FactoryError("pr_changed_outside_factory")
+            if pr["head"]["sha"] == state.sha:
+                return
+            if attempt < 2:
+                self.say(state, "Waiting 5 seconds for GitHub to show the expected commit.")
+                self.pause(seconds=5)
+        raise FactoryError("pr_changed_outside_factory")
 
     def once(self):
         """Resume saved active work or choose the oldest new Issue and record any blocking error."""
@@ -325,7 +335,8 @@ class Workflow:
         self.checkpoint(state, "PUBLISHING_REVIEW", "review_saved")
         self.say(state, "The review report is saved.")
 
-    def pause(self):
-        deadline = time.monotonic() + self.config.poll_interval
+    def pause(self, seconds=None):
+        duration = self.config.poll_interval if seconds is None else seconds
+        deadline = time.monotonic() + duration
         while time.monotonic() < deadline and not self.states.stopped():
             time.sleep(min(0.5, max(0, deadline - time.monotonic())))

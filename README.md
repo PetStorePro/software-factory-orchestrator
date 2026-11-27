@@ -92,6 +92,10 @@ python -m orchestrator.main once
 
 A command finishing normally does not mean the Issue succeeded. Check `status`: the expected final state is `READY_FOR_HUMAN_REVIEW`. A problem leaves it `BLOCKED`, with a reason.
 
+Status returns `stop_requested`, `agent_running` and an `issues` list. Stopping leaves the Issue at its saved stage so it can resume. `agent_running` is `true` for a verified recorded agent, `false` when no agent record exists, and `null` when the record cannot be verified. These fields do not indicate whether the factory itself is running.
+
+If GitHub shows a different PR commit after a push, the factory checks again after 5 seconds and once more after another 5 seconds. A mismatch that remains blocks the Issue. Closed PRs or changed branch names block immediately.
+
 ## Settings and saved data
 
 [.env.example](.env.example) lists the settings: target repository, base branch, separate agent providers, required CI checks, timeouts and retry limits. Only the `codex` provider is implemented.

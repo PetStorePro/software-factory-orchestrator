@@ -1,5 +1,6 @@
 """Run external commands with time limits and support stopping managed agents."""
 
+import json
 import os
 import re
 import signal
@@ -104,9 +105,25 @@ def process_identity(pid):
     )
 
 
+def agent_running(pid_file):
+    """Check the recorded agent identity without changing or stopping any process."""
+
+    if not pid_file.exists():
+        return False
+    try:
+        record = json.loads(pid_file.read_text())
+        pid = record["pid"]
+        if type(pid) is not int or pid <= 1 or not record["identity"]:
+            return None
+        current = process_identity(pid)
+        return True if current == record["identity"] else None
+    except (OSError, ValueError, KeyError, TypeError, FactoryError):
+        # An unverifiable record is not proof that the agent has stopped.
+        return None
+
+
 def stop_agent(pid_file):
     """Stop the recorded agent group only when its process identity can be verified."""
-    import json
 
     if not pid_file.exists():
         return

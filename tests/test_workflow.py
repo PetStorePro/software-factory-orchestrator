@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from orchestrator.agents.base import ProviderResult
 from orchestrator.audit_logger import AuditLogger
@@ -277,7 +278,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(self.reviewer.requests), 1)
         self.assertEqual(self.github.retry_flags, [False, True])
 
-    def test_changed_pr_during_review_is_not_handed_off(self):
+    @patch.object(Workflow, "pause")
+    def test_changed_pr_during_review_is_not_handed_off(self, pause):
         original = self.reviewer.run
 
         def changed(request):
@@ -292,6 +294,25 @@ class WorkflowTests(unittest.TestCase):
         )
         self.assertEqual(self.github.reviews, {})
         self.assertNotIn((1, READY), self.github.labels)
+        self.assertEqual(pause.call_count, 2)
+
+    def test_pr_commit_can_catch_up_but_changed_branch_and_stop_are_rejected(self):
+        from orchestrator.process import FactoryError, Stopped
+
+        state = WorkflowState(1, pr=1, branch="ai/issue-1", sha="expected")
+        expected = dict(state="open", head=dict(sha="expected", ref=state.branch), base=dict(ref="main"))
+        stale = dict(expected, head=dict(sha="old", ref=state.branch))
+        with patch.object(self.github, "pr", side_effect=[stale, stale, expected]), patch.object(self.workflow, "pause") as pause:
+            self.workflow.verify_pr(state)
+            self.assertEqual(pause.call_args_list, [unittest.mock.call(seconds=5)] * 2)
+        changed = dict(expected, base=dict(ref="other"))
+        with patch.object(self.github, "pr", return_value=changed), patch.object(self.workflow, "pause") as pause:
+            with self.assertRaises(FactoryError):
+                self.workflow.verify_pr(state)
+            pause.assert_not_called()
+        with patch.object(self.github, "pr", return_value=stale), patch.object(self.workflow, "pause", side_effect=lambda **_: self.states.request_stop()):
+            with self.assertRaises(Stopped):
+                self.workflow.verify_pr(state)
 
     def test_review_limit_stops_and_keeps_reports(self):
         self.reviewer.verdicts = ["changes_requested"] * self.config.max_review_cycles

@@ -14,7 +14,7 @@ from .audit_logger import AuditLogger
 from .config import Config, FactoryConfig, SANDBOXES
 from .git_manager import GitManager
 from .github_client import GitHubClient, GitHubError, LABELS
-from .process import FactoryError, stop_agent
+from .process import FactoryError, agent_running, stop_agent
 from .state_manager import StateManager, atomic_json, execution_lock
 from .workflow import Workflow
 
@@ -98,10 +98,14 @@ def factory(args):
     if args.command == "status":
         print(
             json.dumps(
-                [
-                    asdict(s) | {"issue_data": "[omitted]", "feedback": "[omitted]"}
-                    for s in states.all()
-                ],
+                {
+                    "stop_requested": states.stopped(),
+                    "agent_running": agent_running(config.runtime / "agent-process.json"),
+                    "issues": [
+                        asdict(s) | {"issue_data": "[omitted]", "feedback": "[omitted]"}
+                        for s in states.all()
+                    ],
+                },
                 indent=2,
             )
         )
